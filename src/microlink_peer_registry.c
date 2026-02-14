@@ -60,7 +60,7 @@ static const char *TAG = "ml_peers";
  *   Saved:  66,560 bytes (~65 KB) - 44% reduction!
  *
  * Tradeoff: Hostname is not stored, only available when peer is in RAM cache
- * (loaded from coordination server). For PSTOP, only crypto keys matter.
+ * (loaded from coordination server). For most applications, only crypto keys matter.
  */
 typedef struct __attribute__((packed)) {
     uint32_t node_id;               // 4 bytes - needed for hostname lookup on-demand

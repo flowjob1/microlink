@@ -36,7 +36,8 @@ extern "C" {
 #define MICROLINK_COORD_TASK_PRIORITY (configMAX_PRIORITIES - 1)  // Highest priority
 
 // Polling intervals for coordination task
-#define MICROLINK_COORD_POLL_INTERVAL_MS  10   // 10ms = 100Hz polling (fast enough to keep up with server)
+// Note: Lower values = more responsive but more CPU/heat. Higher = cooler but slower response.
+#define MICROLINK_COORD_POLL_INTERVAL_MS  50   // 50ms = 20Hz polling (reduced from 100Hz for thermal stability)
 #define MICROLINK_COORD_PING_INTERVAL_MS  5000 // 5 seconds between HTTP/2 PINGs
 
 /* ============================================================================
@@ -172,6 +173,7 @@ typedef struct {
     // Per-peer DISCO state
     struct {
         uint64_t last_probe_ms;
+        uint64_t last_pong_sent_ms;     ///< Rate-limit PONG responses (from dj-oyu fork)
         uint32_t probe_sequence;
         bool active;
     } peer_disco[MICROLINK_MAX_PEERS];
@@ -286,6 +288,7 @@ esp_err_t microlink_disco_handle_derp_packet(microlink_t *ml, const uint8_t *src
                                               const uint8_t *data, size_t len);
 bool microlink_disco_is_disco_packet(const uint8_t *data, size_t len);
 esp_err_t microlink_disco_send_call_me_maybe(microlink_t *ml, uint32_t peer_vpn_ip);
+int microlink_disco_get_socket(void);  // Get DISCO socket fd for magicsock mode
 
 // WireGuard wrapper (will integrate with WireGuard-ESP32-Arduino)
 esp_err_t microlink_wireguard_init(microlink_t *ml);
@@ -299,10 +302,12 @@ esp_err_t microlink_wireguard_send(microlink_t *ml, uint32_t dest_vpn_ip,
 esp_err_t microlink_wireguard_receive(microlink_t *ml);
 esp_err_t microlink_wireguard_inject_derp_packet(microlink_t *ml, uint32_t src_vpn_ip,
                                                   const uint8_t *data, size_t len);
+esp_err_t microlink_wireguard_inject_packet(microlink_t *ml, uint32_t src_ip, uint16_t src_port,
+                                             const uint8_t *data, size_t len);  // Magicsock: inject with port
 void microlink_wireguard_get_public_key(const microlink_t *ml, uint8_t *public_key);
 esp_err_t microlink_wireguard_set_vpn_ip(microlink_t *ml, uint32_t vpn_ip);
 void microlink_wireguard_process_derp_queue(void);
-void microlink_wireguard_set_magicsock(int socket_fd);  // Set the unified socket for magicsock mode
+esp_err_t microlink_wireguard_enable_magicsock(microlink_t *ml);  // Enable magicsock mode (WG uses DISCO socket)
 
 // Utility functions
 uint64_t microlink_get_time_ms(void);

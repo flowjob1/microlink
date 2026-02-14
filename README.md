@@ -12,19 +12,16 @@ MicroLink is a complete, production-ready implementation of the Tailscale protoc
   - DISCO path discovery (PING/PONG/CALL_ME_MAYBE)
   - DERP relay for NAT traversal
   - STUN for public IP discovery
-  - **Bidirectional UDP data transfer** (NEW in v1.2.0)
 
 - **Production Ready**
   - Memory optimized (~100KB SRAM)
   - Tested with ESP32-S3
   - Works with `tailscale ping`
-  - **Bidirectional VPN data transfer** (ESP32 ↔ PC)
 
 - **Easy Integration**
   - Simple C API
   - ESP-IDF component format
   - Kconfig configuration
-  - **Callback-based UDP reception** for low-latency handling
 
 ## Requirements
 
@@ -39,8 +36,9 @@ MicroLink is a complete, production-ready implementation of the Tailscale protoc
 
 For production deployments, **ESP32-S3 with PSRAM is recommended**. The 8MB external PSRAM provides ample headroom for MicroLink's buffers plus your application logic.
 
-Tested hardware:
+Tested/Supported hardware:
 - ESP32-S3 with 8MB PSRAM (recommended)
+- ESP32-P4 (should work as-is, uses standard ESP-IDF APIs)
 - Waveshare ESP32-S3-Touch-AMOLED-2.06
 - Seeed Studio XIAO ESP32S3 Sense
 
@@ -207,31 +205,7 @@ bool microlink_is_connected(const microlink_t *ml);
 microlink_state_t microlink_get_state(const microlink_t *ml);
 ```
 
-### UDP Data Transfer (NEW in v1.2.0)
-
-```c
-// Create UDP socket (port 0 = ephemeral, or specify port to listen)
-microlink_udp_socket_t *sock = microlink_udp_create(ml, port);
-
-// Send UDP data to peer
-esp_err_t err = microlink_udp_send(sock, dest_vpn_ip, dest_port, data, len);
-
-// Receive UDP data (with timeout in ms, 0 = non-blocking)
-esp_err_t err = microlink_udp_recv(sock, &src_ip, &src_port, buffer, &len, timeout_ms);
-
-// Register callback for incoming packets (low-latency option)
-void my_callback(microlink_udp_socket_t *sock, uint32_t src_ip, uint16_t src_port,
-                 const uint8_t *data, size_t len, void *user_data);
-microlink_udp_set_rx_callback(sock, my_callback, user_data);
-
-// Close socket
-microlink_udp_close(sock);
-
-// Parse IP string to uint32_t
-uint32_t ip = microlink_parse_ip("100.64.0.1");
-```
-
-### Raw Data Transfer (Legacy)
+### Data Transfer
 
 ```c
 // Send data to peer
@@ -355,11 +329,6 @@ See the `examples/` directory:
 - `ping_pong/` - Respond to `tailscale ping` with latency monitoring (ESP32-S3)
 - `ping_pong_esp32/` - Memory-optimized version for ESP32 without PSRAM
 - `sensor_node/` - Practical IoT example: send sensor data over VPN
-- **`udp_netcat_example/`** - Bidirectional UDP communication (NEW in v1.2.0)
-  - Send/receive UDP over Tailscale VPN
-  - Equivalent to Linux `netcat -u`
-  - Echo mode for latency testing
-  - See [examples/udp_netcat_example/README.md](examples/udp_netcat_example/README.md)
 
 ## Testing
 
@@ -412,17 +381,189 @@ If your tailnet has a custom `derpMap` configuration that disables certain DERP 
 2. Either change `MICROLINK_DERP_REGION` in menuconfig to an available region, OR
 3. Enable `MICROLINK_DERP_DYNAMIC_DISCOVERY` in menuconfig to auto-detect available regions
 
+## Custom Coordination Server (Headscale/Ionscale)
+
+MicroLink supports custom coordination servers like [Headscale](https://github.com/juanfont/headscale) and [Ionscale](https://github.com/jsiebens/ionscale). This allows you to run your own private Tailscale-compatible control plane.
+
+### Configuration via Menuconfig
+
+Custom coordination server support is available via Kconfig:
+
+```bash
+idf.py menuconfig
+# Navigate to: Component config → MicroLink Configuration → Custom Coordination Server
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `MICROLINK_CUSTOM_COORD_SERVER` | Off | Enable custom coordination server |
+| `MICROLINK_COORD_HOST` | `controlplane.tailscale.com` | Custom server hostname |
+| `MICROLINK_COORD_PORT` | `443` | Custom server port |
+
+**Example for Headscale:**
+
+```ini
+CONFIG_MICROLINK_CUSTOM_COORD_SERVER=y
+CONFIG_MICROLINK_COORD_HOST="headscale.your-domain.com"
+CONFIG_MICROLINK_COORD_PORT=443
+```
+
+### Server Public Key (Automatic)
+
+MicroLink automatically fetches the server's Noise public key from the `/key` endpoint via HTTPS. This means **no manual key configuration is required** for Headscale or Ionscale - just set the hostname and port in Kconfig.
+
+The key fetch happens once at startup and is cached for the session. If the fetch fails (e.g., network issues), MicroLink falls back to the hardcoded Tailscale default key.
+
+**Manual override (optional):** If you need to hardcode a specific server key (e.g., for air-gapped environments), edit `TAILSCALE_SERVER_PUBLIC_KEY_DEFAULT` in `src/microlink_coordination.c`.
+
+### Notes for Custom Servers
+
+1. **DERP Regions**: Custom servers may have different DERP configurations. Enable `MICROLINK_DERP_DYNAMIC_DISCOVERY` in menuconfig to auto-detect available regions.
+
+2. **Auth Keys**: Generate auth keys from your Headscale/Ionscale admin interface, not from Tailscale.
+
+3. **TLS Certificates**: If your custom server uses self-signed certificates, you may need to add them to the ESP32's certificate bundle.
+
+4. **Protocol Compatibility**: MicroLink implements ts2021 protocol. Ensure your coordination server supports this version.
+
+## Performance & Thermal Optimization
+
+MicroLink is optimized for long-running deployments on ESP32. Here are key findings and recommendations:
+
+### Thermal Considerations
+
+The ESP32-S3 can get warm during continuous operation, especially with:
+- High-frequency polling
+- Verbose debug logging
+- Active WiFi transmission
+
+**Symptoms of thermal throttling:**
+- `sendto` calls blocking longer than expected
+- Intermittent connection failures
+- Mutex timeouts in magicsock layer
+
+### Optimizations Applied
+
+| Setting | Default | Optimized | Impact |
+|---------|---------|-----------|--------|
+| WG Debug Logging | Enabled | Disabled | Major CPU reduction |
+| Coordination Poll | 10ms (100Hz) | 50ms (20Hz) | 5x less CPU |
+| DISCO Poll | 20ms (50Hz) | 20ms | Already optimized |
+| Magicsock TX | Could block | select() + timeout | Prevents hangs |
+
+### Recommendations for Production
+
+1. **Disable debug logging** - Set `WG_DEBUG_LOGGING=0` in `wireguardif.c`
+2. **Use a heatsink** on ESP32-S3 for 24/7 operation
+3. **Monitor heap** - Add periodic `esp_get_free_heap_size()` logging
+4. **Adequate TX intervals** - 30 seconds between transmissions is sufficient for heartbeats
+
+### Heap Monitoring
+
+Add this to your main loop for production monitoring:
+
+```c
+static uint32_t last_heap_log = 0;
+uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+if (now - last_heap_log > 60000) {  // Every 60 seconds
+    ESP_LOGI(TAG, "Free heap: %lu bytes", esp_get_free_heap_size());
+    last_heap_log = now;
+}
+```
+
+## Bidirectional UDP Communication
+
+MicroLink supports full bidirectional UDP communication over the Tailscale VPN. This is critical for applications where the ESP32 must be able to initiate communication without waiting for a peer to send first.
+
+### How It Works
+
+1. **Magicsock Mode**: WireGuard and DISCO share a single UDP socket on port 51820
+2. **Direct Path Discovery**: DISCO protocol finds the optimal path (direct UDP or DERP relay)
+3. **Cryptokey Routing**: Packets are routed based on peer's VPN IP using /32 allowed IPs
+
+### ESP32-Initiated TX
+
+For ESP32 to send packets to a peer without receiving first:
+
+1. Handshake must be established (via DERP or direct)
+2. Peer endpoint must be known (learned from DISCO or coordination server)
+3. WireGuard session must be valid
+
+```c
+// Send UDP packet to peer
+microlink_udp_socket_t *sock = microlink_udp_create(ml, 9000);
+microlink_udp_sendto(sock, peer_vpn_ip, 9000, data, len);
+```
+
+### Echo Mode Example
+
+The `udp_netcat_example` demonstrates bidirectional communication:
+
+```bash
+# On PC - send to ESP32, receive echo
+echo "hello" | nc -u 100.65.243.4 9000
+
+# On PC - listen for ESP32-initiated messages
+nc -u -l 9000
+```
+
+### Timing
+
+- **Initial connection**: ~50-60 seconds (WiFi + Tailscale registration + peer discovery)
+- **Handshake establishment**: 1-5 seconds after peer discovery
+- **Round-trip latency**: 30-150ms via DERP, 5-50ms direct
+
 ## License
 
 MIT License - see [LICENSE](LICENSE)
 
+## High-Throughput Mode (Zero-Copy WireGuard)
+
+For applications requiring high data throughput (e.g., video streaming at 30fps+), MicroLink offers an optional zero-copy WireGuard receive mode. This mode uses raw lwIP UDP PCBs instead of BSD sockets, eliminating memory copies and reducing latency.
+
+### Configuration
+
+```bash
+idf.py menuconfig
+# Navigate to: Component config → MicroLink Configuration
+# Enable: "Enable zero-copy WireGuard receive (high-throughput mode)"
+```
+
+### When to Use
+
+| Use Case | Recommended Mode |
+|----------|-----------------|
+| IoT sensors, heartbeats | Standard (default) |
+| Remote control commands | Standard (default) |
+| Video streaming (30fps+) | Zero-copy |
+| Large file transfers | Zero-copy |
+
+### How It Works
+
+Zero-copy mode uses a raw lwIP PCB callback that runs in `tcpip_thread` and demultiplexes:
+- **WireGuard packets** → `wireguardif_network_rx()` directly (zero copy, same thread)
+- **DISCO packets** → SPSC ring buffer for microlink task
+- **STUN responses** → Dedicated buffer for STUN module
+
+This avoids the overhead of BSD socket syscalls and buffer copies, achieving lower latency and higher throughput.
+
 ## Acknowledgments
+
+### Projects & Libraries
 
 - [Tailscale](https://tailscale.com/) for the protocol specification
 - [Headscale](https://github.com/juanfont/headscale) for open-source coordination server insights
 - [WireGuard](https://www.wireguard.com/) for the cryptographic foundation
 - [lwIP](https://savannah.nongnu.org/projects/lwip/) for the TCP/IP stack
 - [wireguard-lwip](https://github.com/smartalock/wireguard-lwip) for WireGuard-lwIP integration
+
+### Contributors
+
+MicroLink includes improvements from community forks:
+
+- **[dj-oyu](https://github.com/dj-oyu)** - Zero-copy WireGuard receive mode, PONG rate-limiting, adaptive probe intervals, symmetric NAT port spray, and path discovery optimizations. Originally developed for high-throughput video streaming on RDK-X5 smart pet camera.
+
+- **[GrieferPig](https://github.com/GrieferPig)** - WireGuard peer lookup fix to prefer peers with valid keypairs, preventing handshake failures with stale peer references.
 
 ## Disclaimer
 

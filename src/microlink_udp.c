@@ -1,6 +1,6 @@
 /**
  * @file microlink_udp.c
- * @brief MicroLink UDP Socket API - PSTOP Transport Layer (Task 1.3)
+ * @brief MicroLink UDP Socket API
  *
  * Provides simple UDP send/receive over Tailscale VPN, equivalent to:
  *   echo "data" | nc -u <tailscale_ip> <port>

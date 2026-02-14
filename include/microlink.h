@@ -337,12 +337,12 @@ void microlink_get_default_config(microlink_config_t *config);
 const char *microlink_get_device_name(void);
 
 /* ============================================================================
- * UDP Socket API (Task 1.3 - PSTOP Transport Layer)
+ * UDP Socket API
  *
  * These functions provide simple UDP send/receive over the Tailscale VPN,
  * equivalent to: echo "data" | nc -u <tailscale_ip> <port>
  *
- * Use these for application-level protocols (like PSTOP heartbeat) that
+ * Use these for application-level protocols (like heartbeat messages) that
  * need to communicate with specific IP:port combinations.
  * ========================================================================== */
 

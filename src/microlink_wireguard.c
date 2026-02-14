@@ -14,6 +14,11 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include <string.h>
+#include <stdio.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <sys/select.h>
 
 // WireGuard-lwIP headers
 #include "wireguardif.h"
@@ -402,23 +407,23 @@ esp_err_t microlink_wireguard_add_peer(microlink_t *ml, const microlink_peer_t *
     wg_peer.public_key = peer_pubkey_b64;
     wg_peer.preshared_key = NULL;  // No PSK for now
 
-    // Set allowed IP - use OUR VPN IP (destination of incoming packets)
-    // The wireguard-lwip implementation checks if the DESTINATION IP of incoming
-    // decrypted packets is in the allowed_source_ips list. So we need to allow
-    // packets destined for our own VPN IP to be accepted.
+    // Set allowed IP to the peer's SPECIFIC VPN IP with /32 mask
+    // This is critical for multi-peer routing - each peer gets only their own VPN IP
+    // so that peer_lookup_by_allowed_ip() returns the correct peer for TX routing.
     //
-    // Note: This is non-standard WireGuard behavior - normally allowed_ips
-    // would check the SOURCE IP. But for Tailscale, all peers in the tailnet
-    // can communicate with each other, so we allow our own IP.
-    microlink_ip_to_lwip(ml->vpn_ip, &wg_peer.allowed_ip);
-    IP4_ADDR(&wg_peer.allowed_mask.u_addr.ip4, 255, 255, 255, 255);  // /32 single host
+    // Note: Standard WireGuard Tailscale configs use 100.64.0.0/10, but that's for
+    // a SINGLE peer scenario. With multiple peers, we need /32 per peer.
+    uint8_t ip_b1 = (peer->vpn_ip >> 24) & 0xFF;
+    uint8_t ip_b2 = (peer->vpn_ip >> 16) & 0xFF;
+    uint8_t ip_b3 = (peer->vpn_ip >> 8) & 0xFF;
+    uint8_t ip_b4 = peer->vpn_ip & 0xFF;
+
+    IP4_ADDR(&wg_peer.allowed_ip.u_addr.ip4, ip_b1, ip_b2, ip_b3, ip_b4);
+    wg_peer.allowed_ip.type = IPADDR_TYPE_V4;
+    IP4_ADDR(&wg_peer.allowed_mask.u_addr.ip4, 255, 255, 255, 255);  // /32 - single host
     wg_peer.allowed_mask.type = IPADDR_TYPE_V4;
 
-    ESP_LOGI(TAG, "Allowing packets destined for our VPN IP: %u.%u.%u.%u",
-             (ml->vpn_ip >> 24) & 0xFF,
-             (ml->vpn_ip >> 16) & 0xFF,
-             (ml->vpn_ip >> 8) & 0xFF,
-             ml->vpn_ip & 0xFF);
+    ESP_LOGI(TAG, "Peer allowed IP: %u.%u.%u.%u/32", ip_b1, ip_b2, ip_b3, ip_b4);
 
     // Set endpoint if available (IPv4 only for now - TODO: add IPv6 WireGuard support)
     if (peer->endpoint_count > 0 && !peer->endpoints[0].is_derp && !peer->endpoints[0].is_ipv6) {
@@ -569,6 +574,23 @@ esp_err_t microlink_wireguard_trigger_handshake(microlink_t *ml, uint32_t vpn_ip
         return ESP_ERR_NOT_FOUND;
     }
 
+    // Check if peer already has a valid session - if so, don't destroy it by initiating new handshake!
+    ip_addr_t current_ip;
+    u16_t current_port;
+    err_t status = wireguardif_peer_is_up((struct netif *)ml->wireguard.netif, peer_index, &current_ip, &current_port);
+
+    if (status == ERR_OK) {
+        // Peer already has a valid keypair! Don't destroy it by initiating a new handshake.
+        // The ERR_CONN from send might be because we're the responder and waiting for first RX.
+        // Just return OK - the session exists, let it work.
+        ESP_LOGI(TAG, "Peer %lu.%lu.%lu.%lu already has valid session, skipping handshake",
+                 (unsigned long)((vpn_ip >> 24) & 0xFF),
+                 (unsigned long)((vpn_ip >> 16) & 0xFF),
+                 (unsigned long)((vpn_ip >> 8) & 0xFF),
+                 (unsigned long)(vpn_ip & 0xFF));
+        return ESP_OK;
+    }
+
     ESP_LOGI(TAG, "Triggering WireGuard handshake to peer %lu.%lu.%lu.%lu (index=%d)",
              (unsigned long)((vpn_ip >> 24) & 0xFF),
              (unsigned long)((vpn_ip >> 16) & 0xFF),
@@ -576,17 +598,27 @@ esp_err_t microlink_wireguard_trigger_handshake(microlink_t *ml, uint32_t vpn_ip
              (unsigned long)(vpn_ip & 0xFF),
              peer_index);
 
-    // Try DERP first (reliable, bypasses NAT)
+    // If peer has a non-zero endpoint, try direct connect first
+    if (!ip_addr_isany(&current_ip) && current_port != 0) {
+        ESP_LOGI(TAG, "Peer has direct endpoint, using wireguardif_connect");
+        err_t err = wireguardif_connect((struct netif *)ml->wireguard.netif, peer_index);
+        if (err == ERR_OK) {
+            ESP_LOGI(TAG, "Direct handshake initiated");
+            return ESP_OK;
+        }
+    }
+
+    // No direct endpoint or direct failed - use DERP
     err_t err = wireguardif_connect_derp((struct netif *)ml->wireguard.netif, peer_index);
     if (err == ERR_OK) {
         ESP_LOGI(TAG, "DERP handshake initiated");
         return ESP_OK;
     }
 
-    // Fallback to direct
+    // Fallback to direct if DERP also failed
     err = wireguardif_connect((struct netif *)ml->wireguard.netif, peer_index);
     if (err == ERR_OK) {
-        ESP_LOGI(TAG, "Direct handshake initiated");
+        ESP_LOGI(TAG, "Direct handshake initiated (fallback)");
         return ESP_OK;
     }
 
@@ -723,6 +755,25 @@ esp_err_t microlink_wireguard_inject_derp_packet(microlink_t *ml, uint32_t src_i
     wireguardif_network_rx(device, device->udp_pcb, p, &src_addr, 41641);
 
     // Note: wireguardif_network_rx frees the pbuf
+
+    return ESP_OK;
+}
+
+esp_err_t microlink_wireguard_inject_packet(microlink_t *ml, uint32_t src_ip, uint16_t src_port,
+                                             const uint8_t *data, size_t len) {
+    if (!ml->wireguard.initialized || !ml->wireguard.netif) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    struct netif *netif = (struct netif *)ml->wireguard.netif;
+
+    // Use the wireguardif library's inject function which properly handles src_port
+    err_t err = wireguardif_inject_packet(netif, src_ip, src_port, data, len);
+
+    if (err != ERR_OK) {
+        ESP_LOGW(TAG, "wireguardif_inject_packet failed: %d", err);
+        return ESP_FAIL;
+    }
 
     return ESP_OK;
 }
@@ -894,6 +945,113 @@ esp_err_t microlink_wireguard_set_vpn_ip(microlink_t *ml, uint32_t vpn_ip) {
     char ip_buf[16];
     ESP_LOGI(TAG, "WireGuard VPN IP set to: %s",
              microlink_vpn_ip_to_str(vpn_ip, ip_buf));
+
+    return ESP_OK;
+}
+
+/* ============================================================================
+ * Magicsock Mode - WireGuard uses DISCO socket for all UDP I/O
+ * ========================================================================== */
+
+// Socket fd for magicsock mode (DISCO socket shared with WireGuard)
+static int magicsock_fd = -1;
+static SemaphoreHandle_t magicsock_mutex = NULL;
+
+/**
+ * @brief UDP output callback for magicsock mode
+ *
+ * Called by wireguard-lwip when it needs to send a UDP packet.
+ * We send via the DISCO socket instead of WireGuard's internal socket.
+ *
+ * NOTE: This can be called from multiple contexts (timer callbacks, RX processing,
+ * main task) so we use a mutex to serialize sendto calls.
+ */
+static err_t magicsock_udp_output(uint32_t dest_ip, uint16_t dest_port,
+                                   const uint8_t *data, size_t len, void *ctx) {
+    if (magicsock_fd < 0) {
+        ESP_LOGE(TAG, "[MAGICSOCK] No socket configured");
+        return ERR_IF;
+    }
+
+    // Take mutex with short timeout to prevent deadlock
+    if (magicsock_mutex && xSemaphoreTake(magicsock_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        ESP_LOGW(TAG, "[MAGICSOCK] Mutex timeout, skipping TX (%u bytes)", (unsigned)len);
+        return ERR_WOULDBLOCK;
+    }
+
+    err_t result = ERR_OK;
+
+    // Use select() to check if socket is writable with timeout
+    // This prevents sendto from blocking indefinitely
+    fd_set write_fds;
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 10000 };  // 10ms timeout
+    FD_ZERO(&write_fds);
+    FD_SET(magicsock_fd, &write_fds);
+
+    int sel_ret = select(magicsock_fd + 1, NULL, &write_fds, NULL, &tv);
+    if (sel_ret <= 0) {
+        ESP_LOGW(TAG, "[MAGICSOCK] Socket not writable (select=%d)", sel_ret);
+        result = ERR_WOULDBLOCK;
+        goto done;
+    }
+
+    // dest_ip is in network byte order from wireguard-lwip
+    struct sockaddr_in dest_addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(dest_port),
+        .sin_addr.s_addr = dest_ip
+    };
+
+    ssize_t sent = sendto(magicsock_fd, data, len, MSG_DONTWAIT,
+                          (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+
+    if (sent < 0) {
+        int err = errno;
+        ESP_LOGW(TAG, "[MAGICSOCK] sendto failed: errno=%d (%s)", err, strerror(err));
+        result = ERR_IF;
+    } else {
+        ESP_LOGD(TAG, "[MAGICSOCK] sent %d bytes to %d.%d.%d.%d:%u",
+                 (int)sent,
+                 (int)(dest_ip & 0xFF), (int)((dest_ip >> 8) & 0xFF),
+                 (int)((dest_ip >> 16) & 0xFF), (int)((dest_ip >> 24) & 0xFF),
+                 dest_port);
+    }
+
+done:
+    if (magicsock_mutex) {
+        xSemaphoreGive(magicsock_mutex);
+    }
+
+    return result;
+}
+
+esp_err_t microlink_wireguard_enable_magicsock(microlink_t *ml) {
+    if (!ml->wireguard.initialized || !ml->wireguard.netif) {
+        ESP_LOGE(TAG, "WireGuard not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Create mutex for thread-safe sendto calls
+    if (!magicsock_mutex) {
+        magicsock_mutex = xSemaphoreCreateMutex();
+        if (!magicsock_mutex) {
+            ESP_LOGE(TAG, "Failed to create magicsock mutex");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    // Get the DISCO socket fd
+    magicsock_fd = microlink_disco_get_socket();
+    if (magicsock_fd < 0) {
+        ESP_LOGE(TAG, "DISCO socket not available");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Register UDP output callback with wireguard-lwip
+    struct netif *netif = (struct netif *)ml->wireguard.netif;
+    wireguardif_set_udp_output(netif, magicsock_udp_output, ml);
+
+    ESP_LOGI(TAG, "Magicsock enabled: WireGuard using DISCO socket fd=%d", magicsock_fd);
 
     return ESP_OK;
 }

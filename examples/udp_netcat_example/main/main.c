@@ -19,7 +19,7 @@
  * Uses callback-based reception for consistent, low-latency packet handling.
  *
  * This validates that the MicroLink UDP transport layer works correctly
- * for the PSTOP integration.
+ * for bidirectional communication.
  */
 
 #include <stdio.h>

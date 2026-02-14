@@ -27,6 +27,8 @@
 #include "lwip/inet.h"     // For htonl, ntohl
 #include "lwip/tcp.h"      // For TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT
 #include "esp_netif.h"     // For getting local WiFi IP address
+#include "esp_http_client.h"  // For HTTPS /key endpoint fetch
+#include "esp_crt_bundle.h"   // For TLS certificate bundle
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
@@ -53,9 +55,14 @@ static int g_server_extra_data_len = 0;
 static uint8_t g_node_key_challenge[32] = {0};
 static bool g_has_node_key_challenge = false;
 
-// Tailscale control plane
+// Tailscale control plane (configurable for Headscale/Ionscale via Kconfig)
+#ifdef CONFIG_MICROLINK_CUSTOM_COORD_SERVER
+#define TAILSCALE_CONTROL_HOST CONFIG_MICROLINK_COORD_HOST
+#define TAILSCALE_CONTROL_PORT CONFIG_MICROLINK_COORD_PORT
+#else
 #define TAILSCALE_CONTROL_HOST "controlplane.tailscale.com"
 #define TAILSCALE_CONTROL_PORT 443
+#endif
 #define TAILSCALE_TS2021_PATH  "/ts2021"
 #define TAILSCALE_PROTOCOL_VERSION 131  // Tailscale Control Protocol version (CapabilityVersion)
 
@@ -578,19 +585,198 @@ static esp_err_t noise_read_message_2(noise_state_t *noise,
 }
 
 /* ============================================================================
- * Tailscale Server Public Key
+ * Server Public Key (fetched dynamically or fallback to Tailscale default)
  * ========================================================================== */
 
-// Tailscale coordination server public key (Curve25519)
+// Fallback: Tailscale coordination server public key (Curve25519)
 // Source: controlplane.tailscale.com/key?v=131
 // IMPORTANT: This is the "publicKey" (ts2021/Noise), NOT the "legacyPublicKey" (nacl crypto_box)
 // Key: mkey:7d2792f9c98d753d2042471536801949104c247f95eac770f8fb321595e2173b
-static const uint8_t TAILSCALE_SERVER_PUBLIC_KEY[32] = {
+static const uint8_t TAILSCALE_SERVER_PUBLIC_KEY_DEFAULT[32] = {
     0x7d, 0x27, 0x92, 0xf9, 0xc9, 0x8d, 0x75, 0x3d,
     0x20, 0x42, 0x47, 0x15, 0x36, 0x80, 0x19, 0x49,
     0x10, 0x4c, 0x24, 0x7f, 0x95, 0xea, 0xc7, 0x70,
     0xf8, 0xfb, 0x32, 0x15, 0x95, 0xe2, 0x17, 0x3b
 };
+
+// Dynamic server public key (fetched from /key endpoint)
+static uint8_t g_server_public_key[32];
+static bool g_server_public_key_fetched = false;
+
+/**
+ * @brief Convert hex character to nibble value
+ */
+static int hex_char_to_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/**
+ * @brief Fetch server's Noise public key from /key endpoint via HTTPS
+ *
+ * This enables automatic support for Headscale/Ionscale without manual key configuration.
+ * The endpoint returns JSON: {"publicKey":"mkey:hex...","legacyPublicKey":"nodekey:hex..."}
+ *
+ * @param out_key Output buffer for 32-byte public key
+ * @return ESP_OK on success, error code on failure
+ */
+static esp_err_t fetch_server_public_key(uint8_t *out_key) {
+    ESP_LOGI(TAG, "Fetching server public key from https://%s:%d/key?v=%d",
+             TAILSCALE_CONTROL_HOST, TAILSCALE_CONTROL_PORT, TAILSCALE_PROTOCOL_VERSION);
+
+    esp_err_t ret = ESP_FAIL;
+    char *response_buf = NULL;
+    esp_http_client_handle_t client = NULL;
+
+    // Allocate response buffer
+    response_buf = malloc(1024);
+    if (!response_buf) {
+        ESP_LOGE(TAG, "Failed to allocate response buffer");
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Build URL
+    char url[256];
+    snprintf(url, sizeof(url), "https://%s:%d/key?v=%d",
+             TAILSCALE_CONTROL_HOST, TAILSCALE_CONTROL_PORT, TAILSCALE_PROTOCOL_VERSION);
+
+    // Configure HTTP client
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = 10000,
+        .crt_bundle_attach = esp_crt_bundle_attach,  // Use certificate bundle for TLS
+    };
+
+    client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGE(TAG, "Failed to init HTTP client");
+        ret = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+
+    // Perform request
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
+        ret = err;
+        goto cleanup;
+    }
+
+    int content_length = esp_http_client_fetch_headers(client);
+    if (content_length < 0) {
+        ESP_LOGE(TAG, "Failed to fetch headers");
+        ret = ESP_FAIL;
+        goto cleanup;
+    }
+
+    int status = esp_http_client_get_status_code(client);
+    if (status != 200) {
+        ESP_LOGE(TAG, "Server returned status %d", status);
+        ret = ESP_FAIL;
+        goto cleanup;
+    }
+
+    // Read response
+    int read_len = esp_http_client_read(client, response_buf, 1023);
+    if (read_len <= 0) {
+        ESP_LOGE(TAG, "Failed to read response");
+        ret = ESP_FAIL;
+        goto cleanup;
+    }
+    response_buf[read_len] = '\0';
+
+    ESP_LOGD(TAG, "Key response: %s", response_buf);
+
+    // Parse JSON to extract publicKey
+    // Format: {"publicKey":"mkey:7d2792f9c98d753d...","legacyPublicKey":"..."}
+    cJSON *root = cJSON_Parse(response_buf);
+    if (!root) {
+        ESP_LOGE(TAG, "Failed to parse JSON response");
+        ret = ESP_FAIL;
+        goto cleanup;
+    }
+
+    cJSON *pub_key_json = cJSON_GetObjectItem(root, "publicKey");
+    if (!pub_key_json || !cJSON_IsString(pub_key_json)) {
+        ESP_LOGE(TAG, "publicKey not found in response");
+        cJSON_Delete(root);
+        ret = ESP_FAIL;
+        goto cleanup;
+    }
+
+    const char *pub_key_str = pub_key_json->valuestring;
+
+    // Expect format "mkey:hex_string" (64 hex chars = 32 bytes)
+    if (strncmp(pub_key_str, "mkey:", 5) != 0) {
+        ESP_LOGE(TAG, "Invalid publicKey format (expected mkey:...)");
+        cJSON_Delete(root);
+        ret = ESP_FAIL;
+        goto cleanup;
+    }
+
+    const char *hex_str = pub_key_str + 5;  // Skip "mkey:"
+    size_t hex_len = strlen(hex_str);
+    if (hex_len != 64) {
+        ESP_LOGE(TAG, "Invalid publicKey length: %d (expected 64)", (int)hex_len);
+        cJSON_Delete(root);
+        ret = ESP_FAIL;
+        goto cleanup;
+    }
+
+    // Decode hex to bytes
+    for (int i = 0; i < 32; i++) {
+        int hi = hex_char_to_nibble(hex_str[i * 2]);
+        int lo = hex_char_to_nibble(hex_str[i * 2 + 1]);
+        if (hi < 0 || lo < 0) {
+            ESP_LOGE(TAG, "Invalid hex character in publicKey");
+            cJSON_Delete(root);
+            ret = ESP_FAIL;
+            goto cleanup;
+        }
+        out_key[i] = (hi << 4) | lo;
+    }
+
+    cJSON_Delete(root);
+    log_hex("Fetched server public key", out_key, 32);
+    ret = ESP_OK;
+
+cleanup:
+    if (client) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+    }
+    if (response_buf) {
+        free(response_buf);
+    }
+    return ret;
+}
+
+/**
+ * @brief Get server public key (fetch if needed, fallback to default for Tailscale)
+ */
+static const uint8_t *get_server_public_key(void) {
+    // If already fetched, return cached key
+    if (g_server_public_key_fetched) {
+        return g_server_public_key;
+    }
+
+    // Try to fetch from /key endpoint
+    esp_err_t err = fetch_server_public_key(g_server_public_key);
+    if (err == ESP_OK) {
+        g_server_public_key_fetched = true;
+        ESP_LOGI(TAG, "Using dynamically fetched server public key");
+        return g_server_public_key;
+    }
+
+    // Fallback to hardcoded Tailscale key
+    ESP_LOGW(TAG, "Failed to fetch server key, using default Tailscale key");
+    memcpy(g_server_public_key, TAILSCALE_SERVER_PUBLIC_KEY_DEFAULT, 32);
+    g_server_public_key_fetched = true;
+    return g_server_public_key;
+}
 
 /* ============================================================================
  * Public API
@@ -637,7 +823,7 @@ generate_new:
     // Generate new machine key (Curve25519 keypair)
     {
         noise_state_t temp_noise;
-        noise_init(&temp_noise, NULL, TAILSCALE_SERVER_PUBLIC_KEY, TAILSCALE_PROTOCOL_VERSION);
+        noise_init(&temp_noise, NULL, get_server_public_key(), TAILSCALE_PROTOCOL_VERSION);
 
         // Store machine keys
         memcpy(ml->coordination.machine_private_key, temp_noise.local_static_private, 32);
@@ -784,9 +970,10 @@ esp_err_t microlink_coordination_register(microlink_t *ml) {
     }
 
     // Initialize Noise handshake with Tailscale protocol version
+    // Server public key is fetched from /key endpoint (supports Headscale/Ionscale)
     noise_state_t noise;
     noise_init(&noise, ml->coordination.machine_private_key,
-               TAILSCALE_SERVER_PUBLIC_KEY, TAILSCALE_PROTOCOL_VERSION);
+               get_server_public_key(), TAILSCALE_PROTOCOL_VERSION);
 
     // Build registration payload (JSON)
     int payload_len = snprintf(payload, 512,
@@ -1817,7 +2004,7 @@ esp_err_t microlink_coordination_register(microlink_t *ml) {
 
     // :authority: controlplane.tailscale.com (literal with indexing)
     hpack_headers[hpack_len++] = 0x41;  // Literal with indexing, name index 1 (:authority)
-    const char *authority = "controlplane.tailscale.com";
+    const char *authority = TAILSCALE_CONTROL_HOST;
     hpack_headers[hpack_len++] = strlen(authority);
     memcpy(hpack_headers + hpack_len, authority, strlen(authority));
     hpack_len += strlen(authority);
@@ -2475,7 +2662,7 @@ esp_err_t microlink_coordination_fetch_peers(microlink_t *ml) {
 
     // :authority: controlplane.tailscale.com
     hpack_headers[hpack_len++] = 0x41;
-    const char *authority = "controlplane.tailscale.com";
+    const char *authority = TAILSCALE_CONTROL_HOST;
     hpack_headers[hpack_len++] = strlen(authority);
     memcpy(hpack_headers + hpack_len, authority, strlen(authority));
     hpack_len += strlen(authority);

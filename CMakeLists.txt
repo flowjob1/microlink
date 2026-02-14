@@ -1,13 +1,24 @@
 # MicroLink - Tailscale-Compatible VPN for ESP32
 # ESP-IDF Component CMakeLists.txt
 
+# Select DISCO implementation based on Kconfig
+# Zero-copy mode uses raw lwIP PCB for high-throughput (video streaming)
+# Default mode uses BSD sockets for simplicity and portability
+if(CONFIG_MICROLINK_ZERO_COPY_WG)
+    set(DISCO_SRC "src/microlink_disco_zerocopy.c")
+    message(STATUS "MicroLink: Using zero-copy DISCO (raw lwIP PCB) - contributed by dj-oyu")
+else()
+    set(DISCO_SRC "src/microlink_disco.c")
+    message(STATUS "MicroLink: Using standard DISCO (BSD sockets)")
+endif()
+
 idf_component_register(
     SRCS
         "src/microlink.c"
         "src/microlink_connection.c"
         "src/microlink_coordination.c"
         "src/microlink_derp.c"
-        "src/microlink_disco.c"
+        "${DISCO_SRC}"
         "src/microlink_stun.c"
         "src/microlink_udp.c"
         "src/microlink_wireguard.c"
