@@ -374,18 +374,25 @@ static void wireguardif_process_response_message(struct wireguard_device *device
 		ip_addr_isany(addr) ? "DERP" : ipaddr_ntoa(addr), port);
 
 	if (wireguard_process_handshake_response(device, peer, response)) {
-		// Packet is good
-		printf("[WG] *** HANDSHAKE COMPLETE! Session starting... ***\n");
+		// Packet is good — identify the peer
+		uint8_t wg_idx = wireguard_peer_index(device, peer);
+		printf("[WG] *** HANDSHAKE COMPLETE! wg_idx=%u key=%02x%02x%02x%02x "
+		       "from=%s:%u ***\n",
+		       wg_idx,
+		       peer->public_key[0], peer->public_key[1],
+		       peer->public_key[2], peer->public_key[3],
+		       ip_addr_isany(addr) ? "DERP" : ipaddr_ntoa(addr), port);
 		// Update the peer location
 		update_peer_addr(peer, addr, port);
 
 		wireguard_start_session(peer, true);
-		printf("[WG] Session started, sending keepalive\n");
+		printf("[WG] Session started, sending keepalive to %s:%u\n",
+		       ip_addr_isany(&peer->ip) ? "DERP" : ipaddr_ntoa(&peer->ip), peer->port);
 		wireguardif_send_keepalive(device, peer);
 
 		// Set the IF-UP flag on netif
 		netif_set_link_up(device->netif);
-		printf("[WG] *** WIREGUARD SESSION ESTABLISHED! ***\n");
+		printf("[WG] *** WIREGUARD SESSION ESTABLISHED wg_idx=%u ***\n", wg_idx);
 	} else {
 		// Packet bad
 		printf("[WG] Handshake response INVALID (crypto failed)\n");
@@ -1180,6 +1187,16 @@ void wireguardif_periodic(struct netif *netif) {
 				wireguardif_send_keepalive(device, peer);
 			}
 			if (should_send_initiation(peer)) {
+				printf("[WG_PERIODIC] Handshake retry wg_idx=%d key=%02x%02x%02x%02x "
+				       "ip=%s:%u connect_ip=%s:%u active=%d send_hs=%d\n",
+				       x,
+				       peer->public_key[0], peer->public_key[1],
+				       peer->public_key[2], peer->public_key[3],
+				       ip_addr_isany(&peer->ip) ? "0.0.0.0" : ipaddr_ntoa(&peer->ip),
+				       peer->port,
+				       ip_addr_isany(&peer->connect_ip) ? "0.0.0.0" : ipaddr_ntoa(&peer->connect_ip),
+				       peer->connect_port,
+				       peer->active, peer->send_handshake);
 				wireguard_start_handshake(device->netif, peer);
 			}
 			if ((peer->curr_keypair.valid) || (peer->prev_keypair.valid)) {

@@ -8,7 +8,7 @@
  *
  * Test from a PC on the same Tailscale network:
  *   Receive:  nc -lu 9000
- *   Send:     echo "hello from PC" | nc -u 100.65.243.4 9000
+ *   Send:     echo "hello from PC" | nc -u <ESP32_VPN_IP> 9000
  */
 
 #include <string.h>

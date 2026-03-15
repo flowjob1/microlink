@@ -276,7 +276,7 @@ Connection states: `ML_STATE_IDLE` → `ML_STATE_WIFI_WAIT` → `ML_STATE_CONNEC
 microlink_udp_socket_t *sock = microlink_udp_create(ml, 9000);
 
 // Send to a peer
-uint32_t dest = microlink_parse_ip("100.81.222.123");
+uint32_t dest = microlink_parse_ip("100.x.y.z");
 microlink_udp_send(sock, dest, 9000, data, len);
 
 // Blocking receive with timeout
@@ -291,6 +291,28 @@ microlink_udp_set_rx_callback(sock, my_rx_handler, user_data);
 // Cleanup
 microlink_udp_close(sock);
 ```
+
+### TCP Communication
+
+```c
+// Connect to a peer over the WG tunnel (triggers handshake if needed)
+microlink_tcp_socket_t *sock = microlink_tcp_connect(ml, "100.x.y.z", 5055);
+
+// Send data
+microlink_tcp_send(sock, data, len);
+
+// Blocking receive with timeout (milliseconds)
+size_t recv_len = sizeof(buffer);
+esp_err_t err = microlink_tcp_recv(sock, buffer, &recv_len, 5000);
+
+// Check connection status
+bool up = microlink_tcp_is_connected(sock);
+
+// Cleanup
+microlink_tcp_close(sock);
+```
+
+TCP sockets are routed through the WireGuard tunnel by binding to the VPN IP internally. The connect call will wait up to 30 seconds for the WG handshake to complete if the peer tunnel isn't already up.
 
 ### MagicDNS Resolution
 
@@ -519,7 +541,7 @@ MicroLink V2 Configuration
 | `ML_ZERO_COPY_WG` | `n` | Zero-copy WireGuard via raw lwIP PCB (for 30fps+ streaming). See [High-Throughput Mode](#high-throughput-mode-zero-copy-wireguard). |
 | `ML_MAX_PEERS` | `16` | Maximum simultaneous active WireGuard tunnels (1-64). Each uses ~200 bytes. This is NOT the tailnet size limit — MicroLink tracks all peers (300+) but only maintains active tunnels to this many at once. Reduce to 8 for non-PSRAM. |
 | `ML_NVS_MAX_PEERS` | `64` | Peers cached in NVS flash (16-1024). Persists across reboots so DISCO probing starts immediately. Each entry: 92 bytes. LRU eviction when full. |
-| `ML_PRIORITY_PEER_IP` | Empty | Priority peer VPN IP (e.g., `100.81.222.123`). Guaranteed a WG slot even when peer table is full — LRU non-priority peer is evicted. Also settable via web UI. |
+| `ML_PRIORITY_PEER_IP` | Empty | Priority peer VPN IP (e.g., `100.x.y.z`). Guaranteed a WG slot even when peer table is full — LRU non-priority peer is evicted. Also settable via web UI. |
 | `ML_H2_BUFFER_SIZE_KB` | `512` | H2 receive buffer (64-2048 KB, PSRAM-backed). Size determines max tailnet: 64KB ≈ 30 peers, 512KB ≈ 300 peers, 2048KB ≈ 1200 peers. |
 | `ML_JSON_BUFFER_SIZE_KB` | `512` | JSON parse buffer (64-2048 KB, PSRAM-backed). cJSON DOM uses 2-3x raw JSON size. Match to H2 buffer. |
 

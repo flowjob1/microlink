@@ -441,18 +441,57 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
     /* Save extra data after msg2 (proactive server transport frames)
      * Server sends these immediately after handshake - each one increments
      * server's tx_nonce. We must process them to keep nonces in sync.
-     * (Matches v1 g_server_extra_data logic) */
+     * (Matches v1 g_server_extra_data logic)
+     *
+     * On fast connections (WiFi), the proactive frames often arrive in
+     * the same TCP segment as the HTTP 101 + msg2. On slow connections
+     * (cellular PPP), they arrive in separate TCP segments. We must
+     * read from the socket if they weren't in the initial buffer. */
     int extra_len = body_buf_len - msg2_total;
-    if (extra_len > 0) {
-        ESP_LOGI(TAG, "Found %d bytes of extra data after msg2 (proactive frames)", extra_len);
+    uint8_t *extra_data = NULL;
 
+    if (extra_len > 0) {
+        /* Fast path: proactive frames were in the initial recv buffer */
+        ESP_LOGI(TAG, "Found %d bytes of extra data after msg2 (proactive frames)", extra_len);
+        extra_data = ml_psram_malloc(extra_len);
+        if (extra_data) {
+            memcpy(extra_data, body_buf + msg2_total, extra_len);
+        }
+    } else {
+        /* Slow path: proactive frames arrive in subsequent TCP segments.
+         * Set a short recv timeout and read them from the socket.
+         * Server sends EarlyNoise immediately after msg2, so they should
+         * arrive within a few hundred ms even on slow cellular links. */
+        ESP_LOGI(TAG, "No extra data in initial buffer, reading proactive frames from socket...");
+        struct timeval short_tv = { .tv_sec = 2, .tv_usec = 0 };
+        ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &short_tv, sizeof(short_tv));
+
+        extra_data = ml_psram_malloc(1024);
+        if (extra_data) {
+            int n = ml_recv(ml->coord_sock, extra_data, 1024, 0);
+            if (n > 0) {
+                extra_len = n;
+                ESP_LOGI(TAG, "Read %d bytes of proactive frames from socket", extra_len);
+            } else {
+                ESP_LOGI(TAG, "No proactive frames from server (n=%d errno=%d)", n, errno);
+                free(extra_data);
+                extra_data = NULL;
+                extra_len = 0;
+            }
+        }
+
+        /* Restore normal recv timeout */
+        struct timeval normal_tv = { .tv_sec = 60, .tv_usec = 0 };
+        ml_setsockopt(ml->coord_sock, SOL_SOCKET, SO_RCVTIMEO, &normal_tv, sizeof(normal_tv));
+    }
+
+    if (extra_data && extra_len > 0) {
         /* Count proactive transport frames */
         int offset = 0;
         int frame_count = 0;
-        uint8_t *extra = body_buf + msg2_total;
         while (offset + 3 <= extra_len) {
-            uint8_t ft = extra[offset];
-            uint16_t fl = (extra[offset + 1] << 8) | extra[offset + 2];
+            uint8_t ft = extra_data[offset];
+            uint16_t fl = (extra_data[offset + 1] << 8) | extra_data[offset + 2];
             if (offset + 3 + fl > extra_len) {
                 ESP_LOGW(TAG, "Incomplete proactive frame at offset %d", offset);
                 break;
@@ -465,11 +504,10 @@ static int do_noise_handshake(microlink_t *ml, ml_noise_state_t *noise) {
 
         /* Store for processing after handshake */
         if (s_server_extra_data) free(s_server_extra_data);
-        s_server_extra_data = ml_psram_malloc(extra_len);
-        if (s_server_extra_data) {
-            memcpy(s_server_extra_data, extra, extra_len);
-            s_server_extra_data_len = extra_len;
-        }
+        s_server_extra_data = extra_data;
+        s_server_extra_data_len = extra_len;
+    } else {
+        if (extra_data) free(extra_data);
     }
 
     free(body_buf);
@@ -767,8 +805,11 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     if (!resp_buf) { free(h2_resp); return -1; }
     size_t resp_total = 0;
 
-    /* Accumulate Noise frames into H2 buffer */
-    for (int frame_count = 0; frame_count < 10; frame_count++) {
+    /* Accumulate Noise frames into H2 buffer.
+     * Scan each frame for H2 END_STREAM on stream 1 to break early
+     * instead of blocking 60s waiting for more data that won't come. */
+    bool got_register_end = false;
+    for (int frame_count = 0; frame_count < 10 && !got_register_end; frame_count++) {
         uint8_t *frame_buf = ml_psram_malloc(4096);
         if (!frame_buf) break;
 
@@ -785,6 +826,23 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
             h2_resp_len += frame_len;
         }
         free(frame_buf);
+
+        /* Scan accumulated buffer for H2 END_STREAM on stream 1 */
+        int scan = 0;
+        while (scan + 9 <= (int)h2_resp_len) {
+            uint32_t fl = (h2_resp[scan] << 16) | (h2_resp[scan+1] << 8) | h2_resp[scan+2];
+            uint8_t ft = h2_resp[scan+3];
+            uint8_t ff = h2_resp[scan+4];
+            uint32_t fs = ((h2_resp[scan+5] & 0x7F) << 24) | (h2_resp[scan+6] << 16) |
+                          (h2_resp[scan+7] << 8) | h2_resp[scan+8];
+            if (fl > 1000000 || scan + 9 + (int)fl > (int)h2_resp_len) break;
+            /* END_STREAM (0x01) on stream 1 in DATA(0x00) or HEADERS(0x01) frame */
+            if (fs == 1 && (ft == 0x00 || ft == 0x01) && (ff & 0x01)) {
+                got_register_end = true;
+                break;
+            }
+            scan += 9 + fl;
+        }
     }
 
     /* Parse H2 frames from accumulated buffer */

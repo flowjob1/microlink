@@ -475,6 +475,7 @@ void ml_coord_task(void *arg);
 void ml_wg_mgr_task(void *arg);
 void ml_wg_mgr_send_cmm(microlink_t *ml, uint32_t peer_vpn_ip);
 esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip);
+bool ml_wg_mgr_peer_is_up(microlink_t *ml, uint32_t vpn_ip);
 
 /* ml_stun.c */
 esp_err_t ml_stun_resolve_servers(microlink_t *ml);

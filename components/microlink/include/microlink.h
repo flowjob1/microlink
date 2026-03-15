@@ -284,6 +284,65 @@ esp_err_t microlink_udp_set_rx_callback(microlink_udp_socket_t *sock,
  */
 uint16_t microlink_udp_get_local_port(const microlink_udp_socket_t *sock);
 
+/* ============================================================================
+ * TCP Socket API
+ *
+ * Provides TCP connections over the Tailscale VPN tunnel.
+ * Traffic is routed through WireGuard — standard BSD TCP sockets
+ * over the encrypted tunnel. Works with any TCP service on a peer
+ * (HTTP, Traccar, MQTT, custom protocols, etc).
+ * ========================================================================== */
+
+/* Opaque TCP socket handle */
+typedef struct microlink_tcp_socket microlink_tcp_socket_t;
+
+/**
+ * @brief Connect TCP to a peer over the VPN tunnel
+ * @param ml Handle
+ * @param dest_ip Destination VPN IP (host byte order)
+ * @param dest_port Destination port
+ * @param timeout_ms Connection timeout in ms (0 = default 15s)
+ * @return Socket handle, NULL on failure
+ *
+ * Automatically triggers WG handshake if tunnel is not yet established.
+ * Retries once if the initial connect fails due to tunnel not ready.
+ */
+microlink_tcp_socket_t *microlink_tcp_connect(microlink_t *ml, uint32_t dest_ip,
+                                                uint16_t dest_port,
+                                                uint32_t timeout_ms);
+
+/**
+ * @brief Send data over TCP connection
+ * @param sock Socket handle
+ * @param data Payload
+ * @param len Payload length
+ * @return ESP_OK on success, ESP_FAIL on error
+ *
+ * Blocks until all data is sent or an error occurs.
+ */
+esp_err_t microlink_tcp_send(microlink_tcp_socket_t *sock, const void *data, size_t len);
+
+/**
+ * @brief Receive data from TCP connection
+ * @param sock Socket handle
+ * @param buffer Output buffer
+ * @param len Buffer size
+ * @param timeout_ms Timeout in ms (0 = use socket default)
+ * @return Bytes received (>0), 0 on timeout, -1 on error/disconnect
+ */
+int microlink_tcp_recv(microlink_tcp_socket_t *sock, void *buffer, size_t len,
+                        uint32_t timeout_ms);
+
+/**
+ * @brief Check if TCP connection is still alive
+ */
+bool microlink_tcp_is_connected(const microlink_tcp_socket_t *sock);
+
+/**
+ * @brief Close TCP connection and free resources
+ */
+void microlink_tcp_close(microlink_tcp_socket_t *sock);
+
 #ifdef __cplusplus
 }
 #endif

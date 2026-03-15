@@ -279,7 +279,10 @@ static esp_err_t wg_init_interface(microlink_t *ml) {
     if (!s_wg_output_pcb) {
         s_wg_output_pcb = udp_new();
         if (s_wg_output_pcb) {
-            udp_bind(s_wg_output_pcb, IP_ADDR_ANY, 0);  /* ephemeral port for now */
+            /* Set source port to 51820 (matching DISCO socket) WITHOUT calling
+             * udp_bind — avoids registering for input which would steal WG
+             * responses from the DISCO BSD socket. udp_sendto uses local_port. */
+            s_wg_output_pcb->local_port = 51820;
             /* DSCP 46 (EF) → WMM AC_VO for low-latency WiFi scheduling */
             s_wg_output_pcb->tos = 0xB8;
         }
@@ -959,13 +962,32 @@ static void process_disco_pong(microlink_t *ml, const ml_rx_packet_t *pkt,
                              (int)((pkt->src_ip >> 24) & 0xFF), (int)((pkt->src_ip >> 16) & 0xFF),
                              (int)((pkt->src_ip >> 8) & 0xFF), (int)(pkt->src_ip & 0xFF),
                              (int)pkt->src_port, p->hostname);
-                    /* First direct path discovery — try a one-shot handshake.
-                     * The peer's DISCO probe means they likely have us in their
-                     * wireguard-go config (our CMM or their activity triggered it). */
+                    /* First direct path discovery — send a one-shot handshake
+                     * via direct UDP. Do NOT use wireguardif_connect() which
+                     * sets peer->active=true and causes infinite handshake
+                     * retries (every 5s) when the peer has us trimmed.
+                     * Instead, just fire a single handshake init. If the peer
+                     * has us configured, it will respond and establish session.
+                     * If not, we stop and wait for them to initiate. */
                     if (!p->tried_initial_handshake) {
                         p->tried_initial_handshake = true;
+                        /* Store endpoint so wireguardif_connect sends to it */
+                        wireguardif_update_endpoint(netif, (u8_t)p->wg_peer_index,
+                                                     &ep_ip, pkt->src_port);
+                        /* Fire one handshake init but don't leave peer active.
+                         * wireguardif_connect sets active=true internally, so
+                         * we immediately clear it after to prevent retries. */
                         wireguardif_connect(netif, (u8_t)p->wg_peer_index);
-                        ESP_LOGI(TAG, "WG initial handshake to %s (first direct path)", p->hostname);
+                        /* Clear active to prevent infinite retry loop.
+                         * If handshake succeeds, the response handler will
+                         * establish the session regardless of active flag. */
+                        {
+                            struct wireguard_device *dev = (struct wireguard_device *)netif->state;
+                            if (dev && p->wg_peer_index < WIREGUARD_MAX_PEERS) {
+                                dev->peers[p->wg_peer_index].active = false;
+                            }
+                        }
+                        ESP_LOGI(TAG, "WG one-shot handshake to %s (first direct path)", p->hostname);
                     }
                 }
             }
@@ -1280,16 +1302,20 @@ void ml_wg_mgr_send_cmm(microlink_t *ml, uint32_t peer_vpn_ip) {
     }
 }
 
-/* On-demand WG handshake trigger (called from UDP API when send fails).
- * Matching Tailscale's endpoint.send() model: ALWAYS send handshake via DERP
- * first (reliable path — goes through peer's magicsock which handles lazy peer
- * reactivation via lazyEndpoint.InitiationMessagePublicKey()), then optionally
- * also store direct endpoint for DISCO-based upgrade after session establishes.
+/* On-demand WG handshake trigger (called from TCP/UDP API when session needed).
  *
- * Why DERP-first: Direct WG handshakes bypass the peer's magicsock and go
- * straight to wireguard-go, which drops them if the peer has us trimmed
- * (lazyPeerIdleThreshold = 5min). DERP handshakes go through magicsock which
- * calls noteRecvActivity → maybeReconfigWireguardLocked to re-add us. */
+ * Dual-path strategy:
+ * 1. DERP: Always send via DERP relay (reliable, works through all NATs)
+ * 2. Direct: If DISCO has discovered a direct endpoint, ALSO send the
+ *    handshake init directly to the peer's UDP port. This is critical
+ *    because the direct path hits magicsock's receiveIPv4() handler which
+ *    calls noteRecvActivity() → maybeReconfigWireguardLocked() to re-add
+ *    trimmed peers to wireguard-go. The DERP path alone does NOT trigger
+ *    this re-add for WG handshake packets, so idle peers silently drop
+ *    DERP-only handshake inits.
+ *
+ * The direct handshake arrives at the peer's magicsock UDP socket, wakes
+ * the lazy peer, and wireguard-go processes the init and responds. */
 esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip) {
     if (!ml || !ml->wg_netif) return ESP_ERR_INVALID_STATE;
 
@@ -1305,13 +1331,57 @@ esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip) {
     err_t is_up = wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index, NULL, NULL);
     if (is_up == ERR_OK) return ESP_OK;
 
-    /* Always use DERP for initial handshake — it goes through peer's magicsock
-     * which handles lazy peer reactivation (JIT re-add to wireguard-go).
-     * DISCO will upgrade to direct path once the session is established. */
+    /* Path 1: DERP (reliable fallback) */
     wireguardif_connect_derp(netif, (u8_t)p->wg_peer_index);
-    ESP_LOGI(TAG, "WG handshake triggered (DERP-first) to %s", p->hostname);
+    ESP_LOGI(TAG, "WG handshake triggered (DERP) to %s", p->hostname);
+
+    /* Path 2: Direct UDP (if DISCO has a known endpoint).
+     * This wakes the peer's magicsock via receiveIPv4 → noteRecvActivity.
+     * Set connect_ip first, then call wireguardif_connect which copies
+     * connect_ip → ip and starts a second handshake to the direct endpoint. */
+    if (p->best_ip != 0 && p->best_port != 0) {
+        ip_addr_t ep_ip;
+        IP_SET_TYPE_VAL(ep_ip, IPADDR_TYPE_V4);
+        ip4_addr_set_u32(ip_2_ip4(&ep_ip), htonl(p->best_ip));
+        wireguardif_update_endpoint(netif, (u8_t)p->wg_peer_index,
+                                     &ep_ip, p->best_port);
+        wireguardif_connect(netif, (u8_t)p->wg_peer_index);
+        ESP_LOGI(TAG, "WG handshake triggered (direct) to %s at %d.%d.%d.%d:%d",
+                 p->hostname,
+                 (int)((p->best_ip >> 24) & 0xFF), (int)((p->best_ip >> 16) & 0xFF),
+                 (int)((p->best_ip >> 8) & 0xFF), (int)(p->best_ip & 0xFF),
+                 (int)p->best_port);
+    }
 
     return ESP_OK;
+}
+
+bool ml_wg_mgr_peer_is_up(microlink_t *ml, uint32_t vpn_ip) {
+    if (!ml || !ml->wg_netif) return false;
+    int idx = find_peer_by_ip(ml, vpn_ip);
+    if (idx < 0) return false;
+    ml_peer_t *p = &ml->peers[idx];
+    if (p->wg_peer_index < 0) return false;
+    struct netif *netif = (struct netif *)ml->wg_netif;
+    ip_addr_t cur_ip;
+    u16_t cur_port;
+    bool up = wireguardif_peer_is_up(netif, (u8_t)p->wg_peer_index, &cur_ip, &cur_port) == ERR_OK;
+    if (up) {
+        /* Verify WG internal peer key matches our DISCO peer */
+        struct wireguard_device *dev = (struct wireguard_device *)netif->state;
+        if (dev && p->wg_peer_index < WIREGUARD_MAX_PEERS) {
+            struct wireguard_peer *wp = &dev->peers[p->wg_peer_index];
+            bool key_match = (memcmp(wp->public_key, p->public_key, 32) == 0);
+            ESP_LOGI(TAG, "WG peer UP: %s wg_idx=%d ep=%s:%u key=%02x%02x%02x%02x %s",
+                     p->hostname, p->wg_peer_index,
+                     ip_addr_isany(&cur_ip) ? "DERP" : ipaddr_ntoa(&cur_ip),
+                     cur_port,
+                     wp->public_key[0], wp->public_key[1],
+                     wp->public_key[2], wp->public_key[3],
+                     key_match ? "KEY_OK" : "KEY_MISMATCH!");
+        }
+    }
+    return up;
 }
 
 /* ============================================================================
