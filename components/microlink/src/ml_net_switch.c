@@ -338,6 +338,9 @@ static void failback_timer_cb(TimerHandle_t timer)
     if (!s_ctx.running) return;
     if (s_ctx.active_transport != ML_NET_CELLULAR) return;
 
+    /* Don't attempt failback if no WiFi credentials configured */
+    if (s_ctx.wifi_ssid[0] == '\0') return;
+
     ESP_LOGI(TAG, "Failback check: attempting WiFi reconnection...");
     s_ctx.state = ML_NET_SW_SWITCHING_TO_WIFI;
 
@@ -354,7 +357,14 @@ static void net_switch_task(void *arg)
 {
     ESP_LOGI(TAG, "Network switch task started");
 
-    /* Step 1: Try WiFi */
+    /* Step 1: Try WiFi (skip if no SSID configured) */
+    bool has_wifi = (s_ctx.wifi_ssid[0] != '\0');
+
+    if (!has_wifi) {
+        ESP_LOGI(TAG, "No WiFi SSID configured, going straight to cellular");
+        goto try_cellular;
+    }
+
     s_ctx.state = ML_NET_SW_WIFI_CONNECTING;
     s_ctx.active_transport = ML_NET_WIFI;
 
