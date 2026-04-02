@@ -19,19 +19,7 @@ set(SRCS
     "src/ml_config_httpd.c"
 )
 
-set(REQUIRES
-    nvs_flash
-    esp_wifi
-    esp_netif
-    esp_event
-    esp_timer
-    lwip
-    mbedtls
-    json
-    driver
-    esp_driver_tsens
-    esp_http_server
-)
+set(REQUIRES nvs_flash esp_wifi esp_netif esp_event esp_timer lwip mbedtls cjson driver esp_driver_tsens esp_http_server)
 
 idf_component_register(
     SRCS ${SRCS}
