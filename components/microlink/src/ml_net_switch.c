@@ -211,12 +211,14 @@ static esp_err_t cellular_start(void)
     ESP_LOGI(TAG, "Starting cellular modem...");
 
     ml_cellular_config_t cell_config = {
-        .tx_pin = CONFIG_ML_CELLULAR_TX_PIN,
-        .rx_pin = CONFIG_ML_CELLULAR_RX_PIN,
         .baud_rate = 115200,
         .apn = s_ctx.apn[0] ? s_ctx.apn : NULL,
         .sim_pin = s_ctx.sim_pin[0] ? s_ctx.sim_pin : NULL,
     };
+#if !CONFIG_ML_BOARD_WAVESHARE_ESP32S3_A7670E_USB
+    cell_config.tx_pin = CONFIG_ML_CELLULAR_TX_PIN;
+    cell_config.rx_pin = CONFIG_ML_CELLULAR_RX_PIN;
+#endif
 
     /* Apply APN: NVS (web UI) > config struct > Kconfig */
     static char nvs_apn[32] = "";

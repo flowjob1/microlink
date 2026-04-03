@@ -24,8 +24,6 @@
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "mbedtls/ssl.h"
-#include "mbedtls/entropy.h"
-#include "mbedtls/ctr_drbg.h"
 #include "esp_heap_caps.h"
 
 #ifdef CONFIG_ML_ZERO_COPY_WG
@@ -324,8 +322,6 @@ typedef struct {
     int sockfd;                     /* Raw TCP socket */
     mbedtls_ssl_context ssl;        /* TLS context (owned exclusively by DERP I/O task) */
     mbedtls_ssl_config ssl_conf;
-    mbedtls_entropy_context entropy;
-    mbedtls_ctr_drbg_context ctr_drbg;
     bool connected;
     uint64_t last_recv_ms;          /* For keepalive watchdog */
 } ml_derp_conn_t;
@@ -544,7 +540,7 @@ uint64_t ml_get_time_ms(void);
 
 #include "ml_at_socket.h"
 
-#ifdef CONFIG_ML_ENABLE_CELLULAR
+#if CONFIG_ML_ENABLE_CELLULAR && !CONFIG_ML_BOARD_WAVESHARE_ESP32S3_A7670E_USB
 #include <sys/socket.h>
 #include <netdb.h>
 #include <unistd.h>
@@ -668,7 +664,7 @@ static inline ssize_t ml_read_sock(int fd, void *buf, size_t len) {
 #define ml_freeaddrinfo freeaddrinfo
 #define ml_write_sock   write
 #define ml_read_sock    read
-#endif /* CONFIG_ML_ENABLE_CELLULAR */
+#endif /* CONFIG_ML_ENABLE_CELLULAR && !CONFIG_ML_BOARD_WAVESHARE_ESP32S3_A7670E_USB */
 
 /* PSRAM allocation helper */
 static inline void *ml_psram_malloc(size_t size) {

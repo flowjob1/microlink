@@ -24,7 +24,7 @@
 extern "C" {
 #endif
 
-#ifdef CONFIG_ML_ENABLE_CELLULAR
+#if CONFIG_ML_ENABLE_CELLULAR && !CONFIG_ML_BOARD_WAVESHARE_ESP32S3_A7670E_USB
 
 /* ============================================================================
  * Initialization
@@ -202,13 +202,13 @@ ssize_t ml_at_write(int fd, const void *buf, size_t len);
  */
 ssize_t ml_at_read(int fd, void *buf, size_t len);
 
-#else /* !CONFIG_ML_ENABLE_CELLULAR */
+#else /* !CONFIG_ML_ENABLE_CELLULAR || CONFIG_ML_BOARD_WAVESHARE_ESP32S3_A7670E_USB */
 
-/* Stubs when cellular is disabled — always report "not ready" */
+/* Stubs when the AT socket backend is unavailable. */
 static inline bool ml_at_socket_is_ready(void) { return false; }
 static inline bool ml_at_socket_is_at_fd(int fd) { (void)fd; return false; }
 
-#endif /* CONFIG_ML_ENABLE_CELLULAR */
+#endif /* CONFIG_ML_ENABLE_CELLULAR && !CONFIG_ML_BOARD_WAVESHARE_ESP32S3_A7670E_USB */
 
 #ifdef __cplusplus
 }

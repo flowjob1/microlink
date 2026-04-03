@@ -164,7 +164,11 @@ static void config_load_peers(ml_config_ctx_t *ctx) {
                 err = nvs_get_blob(ctx->nvs, NVS_KEY_PEERS, tmp, &rlen);
                 if (err == ESP_OK) {
                     uint8_t old_count = tmp[0];
-                    uint16_t count = (old_count <= ML_CONFIG_MAX_ALLOWED_PEERS) ? old_count : 0;
+                    size_t max_old_entries = (stored_len - 1) / sizeof(ml_config_peer_entry_t);
+                    uint16_t count = old_count;
+                    if (count > ML_CONFIG_MAX_ALLOWED_PEERS || count > max_old_entries) {
+                        count = 0;
+                    }
                     memset(&ctx->peer_list, 0, sizeof(ctx->peer_list));
                     ctx->peer_list.count = count;
                     if (count > 0) {

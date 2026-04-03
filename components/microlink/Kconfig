@@ -106,8 +106,9 @@ menu "MicroLink V2 Configuration"
             default n
             help
                 Enable 4G cellular modem driver for MicroLink.
-                Supports SIMCOM SIM7600 and SIM7670 series modems via UART
-                AT socket bridge (AT+NETOPEN/CIPOPEN/CIPSEND).
+                Supports SIMCOM SIM7600 and SIM7670 series modems via UART,
+                and the integrated A7670E on the Waveshare
+                ESP32-S3-A7670E-4G via esp_modem over USB.
 
                 When enabled, MicroLink can operate over cellular data instead
                 of (or in addition to) WiFi. All Tailscale protocol operations
@@ -116,7 +117,14 @@ menu "MicroLink V2 Configuration"
         choice ML_CELLULAR_BOARD
             prompt "Cellular board type"
             depends on ML_ENABLE_CELLULAR
-            default ML_BOARD_WAVESHARE_SIM7600
+            default ML_BOARD_WAVESHARE_ESP32S3_A7670E_USB
+
+            config ML_BOARD_WAVESHARE_ESP32S3_A7670E_USB
+                bool "Waveshare ESP32-S3-A7670E-4G (USB)"
+                help
+                    Waveshare all-in-one ESP32-S3 LTE board with integrated
+                    A7670E modem connected over the internal USB host.
+                    Uses esp_modem plus USB DTE for PPP.
 
             config ML_BOARD_WAVESHARE_SIM7600
                 bool "Waveshare SIM7600X + XIAO ESP32S3"
@@ -140,7 +148,7 @@ menu "MicroLink V2 Configuration"
 
         config ML_CELLULAR_TX_PIN
             int "Cellular UART TX GPIO pin"
-            depends on ML_ENABLE_CELLULAR
+            depends on ML_ENABLE_CELLULAR && !ML_BOARD_WAVESHARE_ESP32S3_A7670E_USB
             default 11 if ML_BOARD_LILYGO_T_SIM7670G
             default 43
             help
@@ -150,7 +158,7 @@ menu "MicroLink V2 Configuration"
 
         config ML_CELLULAR_RX_PIN
             int "Cellular UART RX GPIO pin"
-            depends on ML_ENABLE_CELLULAR
+            depends on ML_ENABLE_CELLULAR && !ML_BOARD_WAVESHARE_ESP32S3_A7670E_USB
             default 10 if ML_BOARD_LILYGO_T_SIM7670G
             default 44
             help
@@ -160,7 +168,7 @@ menu "MicroLink V2 Configuration"
 
         config ML_CELLULAR_PWRKEY_PIN
             int "Modem PWRKEY GPIO pin"
-            depends on ML_ENABLE_CELLULAR
+            depends on ML_ENABLE_CELLULAR && !ML_BOARD_WAVESHARE_ESP32S3_A7670E_USB
             default 18 if ML_BOARD_LILYGO_T_SIM7670G
             default -1
             help
@@ -170,7 +178,7 @@ menu "MicroLink V2 Configuration"
 
         config ML_CELLULAR_DTR_PIN
             int "Modem DTR GPIO pin"
-            depends on ML_ENABLE_CELLULAR
+            depends on ML_ENABLE_CELLULAR && !ML_BOARD_WAVESHARE_ESP32S3_A7670E_USB
             default 9 if ML_BOARD_LILYGO_T_SIM7670G
             default -1
             help
@@ -194,22 +202,20 @@ menu "MicroLink V2 Configuration"
                 PIN code for the SIM card. Leave empty if no PIN required.
 
         config ML_CELLULAR_PPP_USER
-            string "PPP CHAP username"
+            string "PPP username"
             depends on ML_ENABLE_CELLULAR
             default ""
             help
-                Username for PPP CHAP authentication.
-                Leave empty for SIMs that use IMSI-based auth (no credentials).
-                Soracom SIMs use "sora".
+                Username for PPP authentication.
+                Leave empty for SIMs that do not require credentials.
 
         config ML_CELLULAR_PPP_PASS
-            string "PPP CHAP password"
+            string "PPP password"
             depends on ML_ENABLE_CELLULAR
             default ""
             help
-                Password for PPP CHAP authentication.
-                Leave empty for SIMs that use IMSI-based auth (no credentials).
-                Soracom SIMs use "sora".
+                Password for PPP authentication.
+                Leave empty for SIMs that do not require credentials.
 
     endmenu
 
