@@ -13,10 +13,12 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "esp_event.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_modem_api.h"
 #include "esp_modem_usb_c_api.h"
 #include "esp_modem_usb_config.h"
@@ -65,6 +67,12 @@ static void reset_runtime_state(void)
     s_cell.usb_device_gone = false;
 }
 
+static uint32_t elapsed_ms_since(int64_t start_us)
+{
+    int64_t elapsed_us = esp_timer_get_time() - start_us;
+    return (elapsed_us <= 0) ? 0U : (uint32_t)(elapsed_us / 1000);
+}
+
 static esp_err_t collect_line_cb(uint8_t *data, size_t len)
 {
     if (data == NULL || len == 0 || s_cmd_buffer_len >= sizeof(s_cmd_buffer) - 1) {
@@ -84,14 +92,28 @@ static esp_err_t collect_line_cb(uint8_t *data, size_t len)
 
 static esp_err_t modem_command_collect(const char *command, char *response, size_t response_size, uint32_t timeout_ms)
 {
+    char cmd_buffer[96];
+    const char *cmd_to_send = command;
+
     if (s_cell.dce == NULL || command == NULL || response == NULL || response_size == 0) {
         return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t cmd_len = strlen(command);
+    if (cmd_len == 0 || cmd_len >= sizeof(cmd_buffer) - 1) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* esp_modem_command expects a full AT line including line ending. */
+    if (command[cmd_len - 1] != '\r' && command[cmd_len - 1] != '\n') {
+        snprintf(cmd_buffer, sizeof(cmd_buffer), "%s\r", command);
+        cmd_to_send = cmd_buffer;
     }
 
     s_cmd_buffer_len = 0;
     s_cmd_buffer[0] = '\0';
 
-    esp_err_t err = esp_modem_command(s_cell.dce, command, collect_line_cb, timeout_ms);
+    esp_err_t err = esp_modem_command(s_cell.dce, cmd_to_send, collect_line_cb, timeout_ms);
     if (err != ESP_OK) {
         response[0] = '\0';
         return err;
@@ -151,6 +173,72 @@ static bool response_has_registration(const char *response)
     return response != NULL && (strstr(response, ",1") != NULL || strstr(response, ",5") != NULL);
 }
 
+static int parse_registration_stat(const char *response, const char *prefix)
+{
+    if (response == NULL || prefix == NULL) {
+        return -1;
+    }
+
+    const char *line = strstr(response, prefix);
+    if (line == NULL) {
+        return -1;
+    }
+
+    const char *colon = strchr(line, ':');
+    if (colon == NULL) {
+        return -1;
+    }
+
+    char *endptr = NULL;
+    long first = strtol(colon + 1, &endptr, 10);
+    if (endptr == colon + 1) {
+        return -1;
+    }
+
+    while (*endptr == ' ') {
+        endptr++;
+    }
+    if (*endptr == ',') {
+        long second = strtol(endptr + 1, &endptr, 10);
+        if (endptr != NULL) {
+            return (int)second;
+        }
+    }
+
+    return (int)first;
+}
+
+static const char *registration_stat_name(int stat)
+{
+    switch (stat) {
+    case 0: return "not-registered";
+    case 1: return "home";
+    case 2: return "searching";
+    case 3: return "denied";
+    case 4: return "unknown";
+    case 5: return "roaming";
+    default: return "n/a";
+    }
+}
+
+static void log_radio_snapshot(void)
+{
+    char resp[sizeof(s_cmd_buffer)] = { 0 };
+
+    if (modem_command_collect("AT+CPIN?", resp, sizeof(resp), 1500) == ESP_OK) {
+        ESP_LOGI(TAG, "Diag CPIN: %s", resp);
+    }
+    if (modem_command_collect("AT+CSQ", resp, sizeof(resp), 1500) == ESP_OK) {
+        ESP_LOGI(TAG, "Diag CSQ: %s", resp);
+    }
+    if (modem_command_collect("AT+CFUN?", resp, sizeof(resp), 1500) == ESP_OK) {
+        ESP_LOGI(TAG, "Diag CFUN: %s", resp);
+    }
+    if (modem_command_collect("AT+COPS?", resp, sizeof(resp), 1500) == ESP_OK) {
+        ESP_LOGI(TAG, "Diag COPS: %s", resp);
+    }
+}
+
 static void update_signal_quality(void)
 {
     int rssi = 99;
@@ -165,9 +253,9 @@ static void update_signal_quality(void)
 static esp_err_t wait_for_command_channel(void)
 {
     char module_name[sizeof(s_cell.info.model)] = { 0 };
-    uint32_t waited_ms = 0;
+    int64_t start_us = esp_timer_get_time();
 
-    while (waited_ms < MODEM_READY_TIMEOUT_MS) {
+    while (elapsed_ms_since(start_us) < MODEM_READY_TIMEOUT_MS) {
         if (esp_modem_get_module_name(s_cell.dce, module_name) == ESP_OK) {
             snprintf(s_cell.info.model, sizeof(s_cell.info.model), "%s", module_name);
             s_cell.state = ML_CELL_STATE_AT_OK;
@@ -175,9 +263,9 @@ static esp_err_t wait_for_command_channel(void)
         }
 
         vTaskDelay(pdMS_TO_TICKS(500));
-        waited_ms += 500;
     }
 
+    ESP_LOGE(TAG, "AT command channel not ready after %u ms", MODEM_READY_TIMEOUT_MS);
     return ESP_ERR_TIMEOUT;
 }
 
@@ -242,30 +330,61 @@ static esp_err_t ensure_sim_ready(void)
 
 static esp_err_t wait_for_network_registration(void)
 {
-    char response[sizeof(s_cmd_buffer)] = { 0 };
-    uint32_t waited_ms = 0;
+    char cereg_response[sizeof(s_cmd_buffer)] = { 0 };
+    char creg_response[sizeof(s_cmd_buffer)] = { 0 };
+    int64_t start_us = esp_timer_get_time();
+    uint32_t attempt = 0;
 
-    while (waited_ms < NETWORK_WAIT_TIMEOUT_MS) {
-        if (modem_command_collect("AT+CEREG?", response, sizeof(response), 3000) == ESP_OK &&
-            response_has_registration(response)) {
+    while (elapsed_ms_since(start_us) < NETWORK_WAIT_TIMEOUT_MS) {
+        attempt++;
+
+        esp_err_t cereg_err = modem_command_collect("AT+CEREG?", cereg_response, sizeof(cereg_response), 3000);
+        bool cereg_ok = (cereg_err == ESP_OK);
+        int cereg_stat = cereg_ok ? parse_registration_stat(cereg_response, "+CEREG") : -1;
+        if (cereg_ok && response_has_registration(cereg_response)) {
             s_cell.info.registered = true;
             s_cell.state = ML_CELL_STATE_REGISTERED;
             read_static_modem_info();
             return ESP_OK;
         }
 
-        if (modem_command_collect("AT+CREG?", response, sizeof(response), 3000) == ESP_OK &&
-            response_has_registration(response)) {
+        esp_err_t creg_err = modem_command_collect("AT+CREG?", creg_response, sizeof(creg_response), 3000);
+        bool creg_ok = (creg_err == ESP_OK);
+        int creg_stat = creg_ok ? parse_registration_stat(creg_response, "+CREG") : -1;
+        if (creg_ok && response_has_registration(creg_response)) {
             s_cell.info.registered = true;
             s_cell.state = ML_CELL_STATE_REGISTERED;
             read_static_modem_info();
             return ESP_OK;
+        }
+
+        ESP_LOGW(TAG,
+                 "Reg wait attempt=%lu elapsed=%lu ms CEREG=%d(%s) CREG=%d(%s)",
+                 (unsigned long)attempt,
+                 (unsigned long)elapsed_ms_since(start_us),
+                 cereg_stat,
+                 registration_stat_name(cereg_stat),
+                 creg_stat,
+                 registration_stat_name(creg_stat));
+
+        if (!cereg_ok || !creg_ok) {
+            ESP_LOGW(TAG,
+                     "Reg AT errors: CEREG=%s CREG=%s",
+                     esp_err_to_name(cereg_err),
+                     esp_err_to_name(creg_err));
+        }
+
+        if ((attempt % 3U) == 0U) {
+            log_radio_snapshot();
         }
 
         vTaskDelay(pdMS_TO_TICKS(2000));
-        waited_ms += 2000;
     }
 
+    ESP_LOGE(TAG, "Final CEREG response: %s", cereg_response[0] ? cereg_response : "<empty>");
+    ESP_LOGE(TAG, "Final CREG response: %s", creg_response[0] ? creg_response : "<empty>");
+    log_radio_snapshot();
+    ESP_LOGE(TAG, "Network registration timeout after %u ms", NETWORK_WAIT_TIMEOUT_MS);
     return ESP_ERR_TIMEOUT;
 }
 
@@ -450,6 +569,7 @@ esp_err_t ml_cellular_init(const ml_cellular_config_t *config)
 
     err = wait_for_command_channel();
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to establish AT command channel: %s", esp_err_to_name(err));
         destroy_runtime_resources();
         s_cell.state = ML_CELL_STATE_ERROR;
         return err;
@@ -457,6 +577,7 @@ esp_err_t ml_cellular_init(const ml_cellular_config_t *config)
 
     err = ensure_sim_ready();
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SIM not ready: %s", esp_err_to_name(err));
         destroy_runtime_resources();
         s_cell.state = ML_CELL_STATE_ERROR;
         return err;
@@ -464,6 +585,7 @@ esp_err_t ml_cellular_init(const ml_cellular_config_t *config)
 
     err = wait_for_network_registration();
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Cellular network registration failed: %s", esp_err_to_name(err));
         destroy_runtime_resources();
         s_cell.state = ML_CELL_STATE_ERROR;
         return err;
