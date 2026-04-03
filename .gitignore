@@ -20,6 +20,7 @@ backups/
 *.swp
 *.swo
 *~
+*.component_hash
 
 # Test/simulation code (not for production)
 test/
