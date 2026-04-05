@@ -203,6 +203,56 @@ static esp_err_t uart_init(void)
     return ESP_OK;
 }
 
+#if CONFIG_ML_CELLULAR_PWRKEY_PIN >= 0
+static esp_err_t modem_power_cycle_with_pwrkey(void)
+{
+    gpio_config_t pwrkey_conf = {
+        .pin_bit_mask = (1ULL << CONFIG_ML_CELLULAR_PWRKEY_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    esp_err_t err = gpio_config(&pwrkey_conf);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "PWRKEY GPIO config failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    /* Default idle level is LOW; power control is done via HIGH pulses. */
+    gpio_set_level(CONFIG_ML_CELLULAR_PWRKEY_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    ESP_LOGI(TAG,
+             "Modem power cycle: power OFF pulse on GPIO%d (low=%dms, high=%dms)",
+             CONFIG_ML_CELLULAR_PWRKEY_PIN,
+             CONFIG_ML_CELLULAR_PWRKEY_LOW_SETUP_MS,
+             CONFIG_ML_CELLULAR_PWRKEY_OFF_HIGH_MS);
+    gpio_set_level(CONFIG_ML_CELLULAR_PWRKEY_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(CONFIG_ML_CELLULAR_PWRKEY_LOW_SETUP_MS));
+    gpio_set_level(CONFIG_ML_CELLULAR_PWRKEY_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(CONFIG_ML_CELLULAR_PWRKEY_OFF_HIGH_MS));
+    gpio_set_level(CONFIG_ML_CELLULAR_PWRKEY_PIN, 0);
+
+    /* Give the modem time to settle before issuing power-on. */
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    ESP_LOGI(TAG,
+             "Modem power cycle: power ON pulse on GPIO%d (low=%dms, high=%dms)",
+             CONFIG_ML_CELLULAR_PWRKEY_PIN,
+             CONFIG_ML_CELLULAR_PWRKEY_LOW_SETUP_MS,
+             CONFIG_ML_CELLULAR_PWRKEY_ON_HIGH_MS);
+    gpio_set_level(CONFIG_ML_CELLULAR_PWRKEY_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(CONFIG_ML_CELLULAR_PWRKEY_LOW_SETUP_MS));
+    gpio_set_level(CONFIG_ML_CELLULAR_PWRKEY_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(CONFIG_ML_CELLULAR_PWRKEY_ON_HIGH_MS));
+    gpio_set_level(CONFIG_ML_CELLULAR_PWRKEY_PIN, 0);
+
+    return ESP_OK;
+}
+#endif
+
 /* ============================================================================
  * Modem Setup (AT command phase)
  * ========================================================================== */
@@ -814,20 +864,10 @@ esp_err_t ml_cellular_init(const ml_cellular_config_t *config)
      * Use gpio_config() instead of gpio_set_direction() for reliable GPIO init
      * on all ESP32-S3 boards (ref: LilyGO Issue #220). */
 #if CONFIG_ML_CELLULAR_PWRKEY_PIN >= 0
-    ESP_LOGI(TAG, "Modem power-on: PWRKEY pulse on GPIO%d", CONFIG_ML_CELLULAR_PWRKEY_PIN);
-    gpio_config_t pwrkey_conf = {
-        .pin_bit_mask = (1ULL << CONFIG_ML_CELLULAR_PWRKEY_PIN),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&pwrkey_conf);
-    gpio_set_level(CONFIG_ML_CELLULAR_PWRKEY_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(100));
-    gpio_set_level(CONFIG_ML_CELLULAR_PWRKEY_PIN, 0);
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    gpio_set_level(CONFIG_ML_CELLULAR_PWRKEY_PIN, 1);
+    err = modem_power_cycle_with_pwrkey();
+    if (err != ESP_OK) return err;
+#else
+    ESP_LOGW(TAG, "No PWRKEY pin configured (CONFIG_ML_CELLULAR_PWRKEY_PIN < 0) - skipping modem power cycle");
 #endif
 #if CONFIG_ML_CELLULAR_DTR_PIN >= 0
     gpio_config_t dtr_conf = {

@@ -168,6 +168,30 @@ menu "MicroLink V2 Configuration"
                 Set to -1 if not connected (Waveshare: always-on via USB).
                 LILYGO T-SIM7670G-S3: GPIO18.
 
+        config ML_CELLULAR_PWRKEY_LOW_SETUP_MS
+            int "Modem PWRKEY pre-pulse low time (ms)"
+            depends on ML_ENABLE_CELLULAR
+            default 1000
+            range 0 60000
+            help
+                Time to hold PWRKEY low before the high pulse for power on/off.
+
+        config ML_CELLULAR_PWRKEY_ON_HIGH_MS
+            int "Modem PWRKEY power-on high pulse width (ms)"
+            depends on ML_ENABLE_CELLULAR
+            default 100
+            range 1 60000
+            help
+                Width of the high pulse used to request modem power-on.
+
+        config ML_CELLULAR_PWRKEY_OFF_HIGH_MS
+            int "Modem PWRKEY power-off high pulse width (ms)"
+            depends on ML_ENABLE_CELLULAR
+            default 3000
+            range 1 60000
+            help
+                Width of the high pulse used to request modem power-off.
+
         config ML_CELLULAR_DTR_PIN
             int "Modem DTR GPIO pin"
             depends on ML_ENABLE_CELLULAR
