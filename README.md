@@ -86,6 +86,28 @@ git clone https://github.com/CamM2325/microlink.git
 cd microlink/examples/basic_connect    # or: cellular_connect, cellular_heartbeat, failover_connect
 ```
 
+Examples default to the UART modem variant. To switch to the USB variant at configure time, pass `-DMICROLINK_MODE=usb`:
+
+```bash
+idf.py -DMICROLINK_MODE=usb reconfigure build
+```
+
+For your own ESP-IDF projects, point `EXTRA_COMPONENT_DIRS` to exactly one mode folder and keep `REQUIRES microlink` unchanged:
+
+```cmake
+set(EXTRA_COMPONENT_DIRS "/path/to/microlink/microlink-mode-uart")
+# or:
+# set(EXTRA_COMPONENT_DIRS "/path/to/microlink/microlink-mode-usb")
+```
+
+Each mode folder now contains both required components as siblings:
+
+```text
+microlink-mode-uart/
+  microlink/
+  wireguard_lwip/
+```
+
 ### 2. Configure sdkconfig
 
 Add these settings to your `sdkconfig.defaults` file:
