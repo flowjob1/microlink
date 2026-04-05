@@ -95,17 +95,18 @@ idf.py -DMICROLINK_MODE=usb reconfigure build
 For your own ESP-IDF projects, point `EXTRA_COMPONENT_DIRS` to exactly one mode folder and keep `REQUIRES microlink` unchanged:
 
 ```cmake
-set(EXTRA_COMPONENT_DIRS "/path/to/microlink/microlink-mode-uart")
+set(EXTRA_COMPONENT_DIRS "/path/to/microlink/components/microlink-mode-uart")
 # or:
-# set(EXTRA_COMPONENT_DIRS "/path/to/microlink/microlink-mode-usb")
+# set(EXTRA_COMPONENT_DIRS "/path/to/microlink/components/microlink-mode-usb")
 ```
 
 Each mode folder now contains both required components as siblings:
 
 ```text
-microlink-mode-uart/
-  microlink/
-  wireguard_lwip/
+components/
+  microlink-mode-uart/
+    microlink/
+    wireguard_lwip/
 ```
 
 ### 2. Configure sdkconfig
